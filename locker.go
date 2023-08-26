@@ -6,27 +6,23 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-
+	coordinationv1 "k8s.io/api/coordination/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/rest"
-	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/pointer"
-
-	coordinationv1 "k8s.io/api/coordination/v1"
-	coordinationclientv1 "k8s.io/client-go/kubernetes/typed/coordination/v1"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 // Locker implements the Locker interface using the kubernetes Lease resource
 type Locker struct {
-	clientset   kubernetes.Interface
-	leaseClient coordinationclientv1.LeaseInterface
-	namespace   string
-	name        string
-	clientID    string
-	retryWait   time.Duration
-	ttl         time.Duration
+	k8sclient client.Client
+	namespace string
+	name      string
+	clientID  string
+	retryWait time.Duration
+	ttl       time.Duration
 }
 
 type lockerOption func(*Locker) error
@@ -39,22 +35,22 @@ func Namespace(ns string) lockerOption {
 	}
 }
 
-// InClusterConfig configures the Kubernetes client assuming it is running inside a pod
-func InClusterConfig() lockerOption {
+// InClusterClient configures the Kubernetes client assuming it is running inside a pod
+func InClusterClient() lockerOption {
 	return func(l *Locker) error {
-		c, err := inClusterClientset()
+		c, err := localK8sClient()
 		if err != nil {
 			return err
 		}
-		l.clientset = c
+		l.k8sclient = c
 		return nil
 	}
 }
 
-// Clientset configures a custom Kubernetes Clientset
-func Clientset(c kubernetes.Interface) lockerOption {
+// K8sClient configures the Kubernetes client.
+func K8sClient(c client.Client) lockerOption {
 	return func(l *Locker) error {
-		l.clientset = c
+		l.k8sclient = c
 		return nil
 	}
 }
@@ -92,8 +88,7 @@ func NewLocker(name string, options ...lockerOption) (*Locker, error) {
 	}
 
 	for _, opt := range options {
-		err := opt(locker)
-		if err != nil {
+		if err := opt(locker); err != nil {
 			return nil, fmt.Errorf("locker options: %v", err)
 		}
 	}
@@ -110,38 +105,42 @@ func NewLocker(name string, options ...lockerOption) (*Locker, error) {
 		locker.retryWait = time.Duration(1) * time.Second
 	}
 
-	if locker.clientset == nil {
-		c, err := localClientset()
+	if locker.k8sclient == nil {
+		c, err := localK8sClient()
 		if err != nil {
 			return nil, err
 		}
-		locker.clientset = c
+		locker.k8sclient = c
 	}
 
 	// create the Lease if it doesn't exist
-	leaseClient := locker.clientset.CoordinationV1().Leases(locker.namespace)
-	_, err := leaseClient.Get(context.TODO(), name, metav1.GetOptions{})
-	if err != nil {
+	lease := &coordinationv1.Lease{}
+	lease.SetNamespace(locker.namespace)
+	lease.SetName(name)
+	key := types.NamespacedName{
+		Namespace: locker.namespace,
+		Name:      locker.name,
+	}
+	if err := locker.k8sclient.Get(context.TODO(), key, lease); err != nil {
 		if !k8serrors.IsNotFound(err) {
 			return nil, err
 		}
 
 		lease := &coordinationv1.Lease{
 			ObjectMeta: metav1.ObjectMeta{
-				Name: name,
+				Name:      name,
+				Namespace: locker.namespace,
 			},
 			Spec: coordinationv1.LeaseSpec{
 				LeaseTransitions: pointer.Int32Ptr(0),
 			},
 		}
 
-		_, err := leaseClient.Create(context.TODO(), lease, metav1.CreateOptions{})
+		err = locker.k8sclient.Create(context.TODO(), lease)
 		if err != nil {
 			return nil, err
 		}
 	}
-
-	locker.leaseClient = leaseClient
 	return locker, nil
 }
 
@@ -149,7 +148,11 @@ func (l *Locker) lock(ctx context.Context) error {
 	// block until we get a lock
 	for {
 		// get the Lease
-		lease, err := l.leaseClient.Get(ctx, l.name, metav1.GetOptions{})
+		lease := &coordinationv1.Lease{}
+		err := l.k8sclient.Get(ctx, types.NamespacedName{
+			Namespace: l.namespace,
+			Name:      l.name,
+		}, lease)
 		if err != nil {
 			return fmt.Errorf("could not get Lease resource for lock: %w", err)
 		}
@@ -182,7 +185,7 @@ func (l *Locker) lock(ctx context.Context) error {
 		if l.ttl.Seconds() > 0 {
 			lease.Spec.LeaseDurationSeconds = pointer.Int32(int32(l.ttl.Seconds()))
 		}
-		_, err = l.leaseClient.Update(ctx, lease, metav1.UpdateOptions{})
+		err = l.k8sclient.Update(ctx, lease)
 		if err == nil {
 			// we got the lock, break the loop
 			break
@@ -201,7 +204,11 @@ func (l *Locker) lock(ctx context.Context) error {
 }
 
 func (l *Locker) unlock(ctx context.Context) error {
-	lease, err := l.leaseClient.Get(ctx, l.name, metav1.GetOptions{})
+	lease := &coordinationv1.Lease{}
+	err := l.k8sclient.Get(ctx, types.NamespacedName{
+		Namespace: l.namespace,
+		Name:      l.name,
+	}, lease)
 	if err != nil {
 		return fmt.Errorf("could not get Lease resource for lock: %w", err)
 	}
@@ -218,7 +225,7 @@ func (l *Locker) unlock(ctx context.Context) error {
 	lease.Spec.HolderIdentity = nil
 	lease.Spec.AcquireTime = nil
 	lease.Spec.LeaseDurationSeconds = nil
-	_, err = l.leaseClient.Update(ctx, lease, metav1.UpdateOptions{})
+	err = l.k8sclient.Update(ctx, lease)
 	if err != nil {
 		return fmt.Errorf("unlock: error when trying to update Lease: %w", err)
 	}
@@ -226,58 +233,29 @@ func (l *Locker) unlock(ctx context.Context) error {
 	return nil
 }
 
-// Lock will block until the client is the holder of the Lease resource
 func (l *Locker) Lock() {
-	err := l.lock(context.Background())
-	if err != nil {
+	if err := l.LockWithContext(context.Background()); err != nil {
 		panic(err)
 	}
 }
 
-// Unlock will remove the client as the holder of the Lease resource
 func (l *Locker) Unlock() {
-	err := l.unlock(context.Background())
-	if err != nil {
+	if err := l.UnlockWithContext(context.Background()); err != nil {
 		panic(err)
 	}
 }
 
 // LockContext will block until the client is the holder of the Lease resource
-func (l *Locker) LockContext(ctx context.Context) error {
+func (l *Locker) LockWithContext(ctx context.Context) error {
 	return l.lock(ctx)
 }
 
 // UnlockContext will remove the client as the holder of the Lease resource
-func (l *Locker) UnlockContext(ctx context.Context) error {
+func (l *Locker) UnlockWithContext(ctx context.Context) error {
 	return l.unlock(ctx)
 }
 
-func localClientset() (kubernetes.Interface, error) {
-	rules := clientcmd.NewDefaultClientConfigLoadingRules()
-	overrides := &clientcmd.ConfigOverrides{}
-	config, err := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(rules, overrides).ClientConfig()
-	if err != nil {
-		return nil, err
-	}
-
-	if config == nil {
-		config = &rest.Config{}
-	}
-	clientset, err := kubernetes.NewForConfig(config)
-	if err != nil {
-		return nil, err
-	}
-	return clientset, nil
-}
-
-func inClusterClientset() (kubernetes.Interface, error) {
-	config, err := rest.InClusterConfig()
-	if err != nil {
-		return nil, err
-	}
-	clientset, err := kubernetes.NewForConfig(config)
-	if err != nil {
-		return nil, err
-	}
-	return clientset, nil
+func localK8sClient() (client.Client, error) {
+	config := ctrl.GetConfigOrDie()
+	return client.New(config, client.Options{})
 }

@@ -3,15 +3,17 @@ package k8slock
 import (
 	"context"
 	"errors"
+	"log"
 	"math/rand"
 	"sync"
 	"testing"
 	"time"
 
+	coordinationv1 "k8s.io/api/coordination/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
-	"k8s.io/client-go/kubernetes/fake"
+	"k8s.io/client-go/kubernetes/scheme"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/envtest"
 )
 
 // number of lockers to run in parallel
@@ -20,12 +22,33 @@ var parallelCount = 5
 // number of times each locker should lock then unlock
 var lockAttempts = 3
 
-var clientset = fake.NewSimpleClientset()
+var k8sclient client.Client
+
+func init() {
+	useExistingCluster := true
+	testEnv := &envtest.Environment{
+		ErrorIfCRDPathMissing:    true,
+		AttachControlPlaneOutput: true,
+		// local cluster is not working in our test case, like create pod by deployment controller
+		UseExistingCluster: &useExistingCluster,
+	}
+
+	// cfg is defined in this file globally.
+	cfg, err := testEnv.Start()
+	if err != nil {
+		log.Fatalf("Error starting testenv: %v", err)
+	}
+
+	k8sclient, err = client.New(cfg, client.Options{Scheme: scheme.Scheme})
+	if err != nil {
+		log.Fatalf("Error creating client: %v", err)
+	}
+}
 
 func TestLocker(t *testing.T) {
 	lockers := []sync.Locker{}
 	for i := 0; i < parallelCount; i++ {
-		locker, err := NewLocker("lock-test", Clientset(clientset))
+		locker, err := NewLocker("lock-test", K8sClient(k8sclient))
 		if err != nil {
 			t.Fatalf("error creating LeaseLocker: %v", err)
 		}
@@ -51,12 +74,12 @@ func TestLocker(t *testing.T) {
 func TestLockTTL(t *testing.T) {
 	ttlSeconds := 10
 
-	locker1, err := NewLocker("ttl-test", TTL(time.Duration(ttlSeconds)*time.Second), Clientset(clientset))
+	locker1, err := NewLocker("ttl-test", TTL(time.Duration(ttlSeconds)*time.Second), K8sClient(k8sclient))
 	if err != nil {
 		t.Fatalf("error creating LeaseLocker: %v", err)
 	}
 
-	locker2, err := NewLocker("ttl-test", Clientset(clientset))
+	locker2, err := NewLocker("ttl-test", K8sClient(k8sclient))
 	if err != nil {
 		t.Fatalf("error creating LeaseLocker: %v", err)
 	}
@@ -79,7 +102,10 @@ func TestPanicErrorWrap(t *testing.T) {
 		t.Fatalf("error creating LeaseLocker: %v", err)
 	}
 
-	_ = locker.leaseClient.Delete(context.Background(), locker.name, metav1.DeleteOptions{})
+	lease := &coordinationv1.Lease{}
+	lease.SetNamespace(locker.namespace)
+	lease.SetName(locker.name)
+	_ = locker.k8sclient.Delete(context.Background(), lease)
 
 	var panicErr error
 	func() {
