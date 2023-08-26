@@ -18,6 +18,9 @@ import (
 
 // Locker implements the Locker interface using the kubernetes Lease resource
 type Locker struct {
+	ctx    context.Context
+	cancel context.CancelFunc
+
 	k8sclient client.Client
 	namespace string
 	name      string
@@ -57,7 +60,7 @@ func K8sClient(c client.Client) lockerOption {
 }
 
 // RetryWaitDuration is the duration the Lock function will wait before retrying
-// after failing to acquire the lock
+// after failing to acquire the lock, defaults to 100 milliseconds
 func RetryWaitDuration(d time.Duration) lockerOption {
 	return func(l *Locker) error {
 		l.retryWait = d
@@ -82,6 +85,13 @@ func TTL(ttl time.Duration) lockerOption {
 	}
 }
 
+func Context(ctx context.Context) lockerOption {
+	return func(l *Locker) error {
+		l.ctx = ctx
+		return nil
+	}
+}
+
 // NewLocker creates a Locker
 func NewLocker(name string, options ...lockerOption) (*Locker, error) {
 	locker := &Locker{
@@ -94,6 +104,10 @@ func NewLocker(name string, options ...lockerOption) (*Locker, error) {
 		}
 	}
 
+	if locker.ctx == nil {
+		locker.ctx, locker.cancel = context.WithTimeout(context.Background(), 10*time.Second)
+	}
+
 	if locker.namespace == "" {
 		locker.namespace = "default"
 	}
@@ -103,7 +117,7 @@ func NewLocker(name string, options ...lockerOption) (*Locker, error) {
 	}
 
 	if locker.retryWait == 0 {
-		locker.retryWait = time.Duration(1) * time.Second
+		locker.retryWait = time.Millisecond * 100
 	}
 
 	if locker.ttl == 0 {
@@ -227,6 +241,12 @@ func (l *Locker) lock(ctx context.Context) error {
 }
 
 func (l *Locker) unlock(ctx context.Context) error {
+	defer func() {
+		if l.cancel != nil {
+			l.cancel()
+		}
+	}()
+
 	lease := &coordinationv1.Lease{}
 	err := l.k8sclient.Get(ctx, types.NamespacedName{
 		Namespace: l.namespace,
@@ -252,26 +272,17 @@ func (l *Locker) unlock(ctx context.Context) error {
 	return nil
 }
 
+// Lock blocks until the lock is acquired or the context is cancelled
 func (l *Locker) Lock() {
-	if err := l.LockWithContext(context.Background()); err != nil {
+	if err := l.lock(l.ctx); err != nil {
 		panic(err)
 	}
 }
 
 func (l *Locker) Unlock() {
-	if err := l.UnlockWithContext(context.Background()); err != nil {
+	if err := l.unlock(l.ctx); err != nil {
 		panic(err)
 	}
-}
-
-// LockContext will block until the client is the holder of the Lease resource
-func (l *Locker) LockWithContext(ctx context.Context) error {
-	return l.lock(ctx)
-}
-
-// UnlockContext will remove the client as the holder of the Lease resource
-func (l *Locker) UnlockWithContext(ctx context.Context) error {
-	return l.unlock(ctx)
 }
 
 func localK8sClient() (client.Client, error) {

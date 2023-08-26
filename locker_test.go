@@ -48,7 +48,10 @@ func init() {
 func TestLocker(t *testing.T) {
 	lockers := []sync.Locker{}
 	for i := 0; i < parallelCount; i++ {
-		locker, err := NewLocker("lock-test", K8sClient(k8sclient))
+		locker, err := NewLocker("lock-test",
+			K8sClient(k8sclient),
+			Context(context.Background()),
+		)
 		if err != nil {
 			t.Fatalf("error creating LeaseLocker: %v", err)
 		}
@@ -74,12 +77,19 @@ func TestLocker(t *testing.T) {
 func TestLockTTL(t *testing.T) {
 	ttlSeconds := 10
 
-	locker1, err := NewLocker("ttl-test", TTL(time.Duration(ttlSeconds)*time.Second), K8sClient(k8sclient))
+	locker1, err := NewLocker("ttl-test",
+		TTL(time.Duration(ttlSeconds)*time.Second),
+		K8sClient(k8sclient),
+		Context(context.Background()),
+	)
 	if err != nil {
 		t.Fatalf("error creating LeaseLocker: %v", err)
 	}
 
-	locker2, err := NewLocker("ttl-test", K8sClient(k8sclient))
+	locker2, err := NewLocker("ttl-test",
+		K8sClient(k8sclient),
+		Context(context.Background()),
+	)
 	if err != nil {
 		t.Fatalf("error creating LeaseLocker: %v", err)
 	}
