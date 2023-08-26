@@ -134,50 +134,53 @@ func NewLocker(name string, options ...lockerOption) (*Locker, error) {
 
 	// create the Lease if it doesn't exist
 	lease := &coordinationv1.Lease{}
-	lease.SetNamespace(locker.namespace)
-	lease.SetName(name)
 	key := types.NamespacedName{
 		Namespace: locker.namespace,
 		Name:      locker.name,
 	}
-	if err := locker.k8sclient.Get(context.TODO(), key, lease); err != nil {
-		if !k8serrors.IsNotFound(err) {
-			return nil, err
-		}
-
-		err = locker.createLease(context.Background())
+	err := locker.k8sclient.Get(locker.ctx, key, lease)
+	if err != nil && !k8serrors.IsNotFound(err) {
+		return nil, err
+	}
+	if k8serrors.IsNotFound(err) {
+		err = locker.createLease()
 		if err != nil && !k8serrors.IsAlreadyExists(err) {
 			return nil, err
 		}
 	}
+
 	return locker, nil
 }
 
-func (l *Locker) createLease(ctx context.Context) error {
+func (l *Locker) createLease() error {
 	lease := &coordinationv1.Lease{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      l.name,
 			Namespace: l.namespace,
 		},
 		Spec: coordinationv1.LeaseSpec{
-			LeaseTransitions: pointer.Int32Ptr(0),
+			HolderIdentity: pointer.String(l.clientID),
+			AcquireTime:    &metav1.MicroTime{Time: time.Now()},
 		},
 	}
-	return l.k8sclient.Create(ctx, lease)
+	if l.ttl.Seconds() > 0 {
+		lease.Spec.LeaseDurationSeconds = pointer.Int32(int32(l.ttl.Seconds()))
+	}
+	return l.k8sclient.Create(l.ctx, lease)
 }
 
-func (l *Locker) lock(ctx context.Context) error {
+func (l *Locker) lock() error {
 	// block until we get a lock
 	for {
 		select {
-		case <-ctx.Done():
+		case <-l.ctx.Done():
 			return errors.New("lock failed: context cancelled")
 		default:
 		}
 
 		// get the Lease
 		lease := &coordinationv1.Lease{}
-		err := l.k8sclient.Get(ctx, types.NamespacedName{
+		err := l.k8sclient.Get(l.ctx, types.NamespacedName{
 			Namespace: l.namespace,
 			Name:      l.name,
 		}, lease)
@@ -185,62 +188,60 @@ func (l *Locker) lock(ctx context.Context) error {
 			return fmt.Errorf("could not get Lease resource for lock: %w", err)
 		}
 		if k8serrors.IsNotFound(err) {
-			// the Lease has been deleted, recreate it
-			err = l.createLease(ctx)
+			// the Lease has been unlocked, recreate it
+			err = l.createLease()
 			if err != nil && !k8serrors.IsAlreadyExists(err) {
 				return fmt.Errorf("could not create Lease resource for lock: %w", err)
 			}
-			time.Sleep(l.retryWait)
-			continue
+			if k8serrors.IsAlreadyExists(err) {
+				time.Sleep(l.retryWait)
+				continue
+			}
 		}
 
-		if lease.Spec.HolderIdentity != nil {
+		// check if the lease was held by this client
+		if lease.Spec.HolderIdentity == nil ||
+			*lease.Spec.HolderIdentity != l.clientID {
+
+			// held by other client
+			// ttl=0 means the lock never expires
 			if lease.Spec.LeaseDurationSeconds == nil {
 				// The lock is already held and has no expiry
 				time.Sleep(l.retryWait)
 				continue
 			}
 
-			acquireTime := lease.Spec.AcquireTime.Time
-			leaseDuration := time.Duration(*lease.Spec.LeaseDurationSeconds) * time.Second
-
-			if acquireTime.Add(leaseDuration).After(time.Now()) {
-				// The lock is already held and hasn't expired yet
-				time.Sleep(l.retryWait)
-				continue
+			// check if the lock has expired
+			if lease.Spec.AcquireTime != nil {
+				acquireTime := lease.Spec.AcquireTime.Time
+				leaseDuration := time.Duration(*lease.Spec.LeaseDurationSeconds) * time.Second
+				if acquireTime.Add(leaseDuration).After(time.Now()) {
+					// The lock is already held and hasn't expired yet
+					time.Sleep(l.retryWait)
+					continue
+				}
 			}
 		}
 
-		// nobody holds the lock, try and lock it
+		// hold the lock
 		lease.Spec.HolderIdentity = pointer.String(l.clientID)
-		if lease.Spec.LeaseTransitions != nil {
-			lease.Spec.LeaseTransitions = pointer.Int32((*lease.Spec.LeaseTransitions) + 1)
-		} else {
-			lease.Spec.LeaseTransitions = pointer.Int32((*lease.Spec.LeaseTransitions) + 1)
-		}
-		lease.Spec.AcquireTime = &metav1.MicroTime{time.Now()}
-		if l.ttl.Seconds() > 0 {
-			lease.Spec.LeaseDurationSeconds = pointer.Int32(int32(l.ttl.Seconds()))
-		}
-		err = l.k8sclient.Update(ctx, lease)
+		lease.Spec.AcquireTime = &metav1.MicroTime{Time: time.Now()}
+		err = l.k8sclient.Update(l.ctx, lease)
 		if err == nil {
 			// we got the lock, break the loop
-			break
+			return nil
 		}
-
 		if !k8serrors.IsConflict(err) {
 			// if the error isn't a conflict then something went horribly wrong
 			return fmt.Errorf("lock: error when trying to update Lease: %w", err)
 		}
-
 		// Another client beat us to the lock
 		time.Sleep(l.retryWait)
 	}
-
 	return nil
 }
 
-func (l *Locker) unlock(ctx context.Context) error {
+func (l *Locker) unlock() error {
 	defer func() {
 		if l.cancel != nil {
 			l.cancel()
@@ -248,25 +249,25 @@ func (l *Locker) unlock(ctx context.Context) error {
 	}()
 
 	lease := &coordinationv1.Lease{}
-	err := l.k8sclient.Get(ctx, types.NamespacedName{
+	err := l.k8sclient.Get(l.ctx, types.NamespacedName{
 		Namespace: l.namespace,
 		Name:      l.name,
 	}, lease)
-	if err != nil {
+	if err != nil && !k8serrors.IsNotFound(err) {
 		return fmt.Errorf("could not get Lease resource for lock: %w", err)
+	}
+	if k8serrors.IsNotFound(err) {
+		return nil
 	}
 
 	// the holder has to have a value and has to be our ID for us to be able to unlock
-	if lease.Spec.HolderIdentity == nil {
-		return fmt.Errorf("unlock: no lock holder value")
+	if lease.Spec.HolderIdentity == nil ||
+		*lease.Spec.HolderIdentity != l.clientID {
+		return nil
 	}
 
-	if *lease.Spec.HolderIdentity != l.clientID {
-		return fmt.Errorf("unlock: not the lock holder")
-	}
-
-	err = l.k8sclient.Delete(ctx, lease)
-	if err != nil {
+	err = l.k8sclient.Delete(l.ctx, lease)
+	if err != nil && !k8serrors.IsNotFound(err) {
 		return fmt.Errorf("unlock: error when trying to delete Lease: %w", err)
 	}
 	return nil
@@ -274,13 +275,13 @@ func (l *Locker) unlock(ctx context.Context) error {
 
 // Lock blocks until the lock is acquired or the context is cancelled
 func (l *Locker) Lock() {
-	if err := l.lock(l.ctx); err != nil {
+	if err := l.lock(); err != nil {
 		panic(err)
 	}
 }
 
 func (l *Locker) Unlock() {
-	if err := l.unlock(l.ctx); err != nil {
+	if err := l.unlock(); err != nil {
 		panic(err)
 	}
 }

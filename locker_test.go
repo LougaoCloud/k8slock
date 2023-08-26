@@ -2,15 +2,12 @@ package k8slock
 
 import (
 	"context"
-	"errors"
 	"log"
 	"math/rand"
 	"sync"
 	"testing"
 	"time"
 
-	coordinationv1 "k8s.io/api/coordination/v1"
-	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/utils/pointer"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -105,35 +102,4 @@ func TestLockTTL(t *testing.T) {
 	//if diff.Seconds() < float64(ttlSeconds) {
 	//	t.Fatalf("client was able to acquire lock before the existing one had expired, diff: %v", diff)
 	//}
-}
-
-func TestPanicErrorWrap(t *testing.T) {
-	locker, err := NewLocker("wrap-test")
-	if err != nil {
-		t.Fatalf("error creating LeaseLocker: %v", err)
-	}
-
-	lease := &coordinationv1.Lease{}
-	lease.SetNamespace(locker.namespace)
-	lease.SetName(locker.name)
-	_ = locker.k8sclient.Delete(context.Background(), lease)
-
-	var panicErr error
-	func() {
-		defer func() {
-			if r := recover(); r != nil {
-				panicErr = r.(error)
-			}
-		}()
-		locker.Unlock()
-	}()
-
-	if panicErr == nil {
-		t.Fatalf("expected panic, but got none")
-	}
-
-	checkErr := new(k8serrors.StatusError)
-	if !errors.As(panicErr, &checkErr) {
-		t.Fatalf("expected StatusError, but got: %v", panicErr)
-	}
 }
