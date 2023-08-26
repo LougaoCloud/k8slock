@@ -27,6 +27,8 @@ type Locker struct {
 	clientID  string
 	retryWait time.Duration
 	ttl       time.Duration
+
+	ownerRef *metav1.OwnerReference
 }
 
 type lockerOption func(*Locker) error
@@ -88,6 +90,15 @@ func TTL(ttl time.Duration) lockerOption {
 func Context(ctx context.Context) lockerOption {
 	return func(l *Locker) error {
 		l.ctx = ctx
+		return nil
+	}
+}
+
+// OwnerRef is the OwnerReference to set on the Lease.
+// This is useful if you want to delete the Lease when the owner is deleted.
+func OwnerRef(ownerRef *metav1.OwnerReference) lockerOption {
+	return func(l *Locker) error {
+		l.ownerRef = ownerRef
 		return nil
 	}
 }
@@ -165,6 +176,9 @@ func (l *Locker) createLease() error {
 	}
 	if l.ttl.Seconds() > 0 {
 		lease.Spec.LeaseDurationSeconds = pointer.Int32(int32(l.ttl.Seconds()))
+	}
+	if l.ownerRef != nil {
+		lease.SetOwnerReferences([]metav1.OwnerReference{*l.ownerRef})
 	}
 	return l.k8sclient.Create(l.ctx, lease)
 }

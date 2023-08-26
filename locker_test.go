@@ -8,6 +8,10 @@ import (
 	"testing"
 	"time"
 
+	coordinationv1 "k8s.io/api/coordination/v1"
+	corev1 "k8s.io/api/core/v1"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/utils/pointer"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -102,4 +106,42 @@ func TestLockTTL(t *testing.T) {
 	//if diff.Seconds() < float64(ttlSeconds) {
 	//	t.Fatalf("client was able to acquire lock before the existing one had expired, diff: %v", diff)
 	//}
+}
+
+func TestOwnerRef(t *testing.T) {
+
+	// create an owner
+	cm := &corev1.ConfigMap{}
+	cm.SetNamespace("default")
+	cm.SetName("owner-ref-test")
+	if err := k8sclient.Create(context.Background(), cm); err != nil {
+		t.Fatalf("error creating owner: %v", err)
+	}
+
+	_, err := NewLocker("owner-ref-test",
+		OwnerRef(metav1.NewControllerRef(cm, corev1.SchemeGroupVersion.WithKind("ConfigMap"))),
+		K8sClient(k8sclient),
+		Context(context.Background()),
+	)
+	if err != nil {
+		t.Fatalf("error creating LeaseLocker: %v", err)
+	}
+
+	if err := k8sclient.Delete(context.Background(), cm); err != nil {
+		t.Fatalf("error deleting owner: %v", err)
+	}
+
+	time.Sleep(1 * time.Second)
+	lease := &coordinationv1.Lease{}
+	err = k8sclient.Get(context.Background(), client.ObjectKey{
+		Namespace: "default",
+		Name:      "owner-ref-test",
+	}, lease)
+	if err != nil && !k8serrors.IsNotFound(err) {
+		t.Fatalf("error getting lease: %v", err)
+	}
+	if k8serrors.IsNotFound(err) || !lease.DeletionTimestamp.IsZero() {
+		return
+	}
+	t.Fatal("lease should be deleted, but not")
 }
