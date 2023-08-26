@@ -2,6 +2,7 @@ package k8slock
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -73,7 +74,7 @@ func ClientID(id string) lockerOption {
 }
 
 // TTL is the duration a lock can exist before it can be forcibly acquired
-// by another client
+// by another client, defaults to 15 seconds
 func TTL(ttl time.Duration) lockerOption {
 	return func(l *Locker) error {
 		l.ttl = ttl
@@ -105,6 +106,10 @@ func NewLocker(name string, options ...lockerOption) (*Locker, error) {
 		locker.retryWait = time.Duration(1) * time.Second
 	}
 
+	if locker.ttl == 0 {
+		locker.ttl = time.Duration(15) * time.Second
+	}
+
 	if locker.k8sclient == nil {
 		c, err := localK8sClient()
 		if err != nil {
@@ -126,35 +131,53 @@ func NewLocker(name string, options ...lockerOption) (*Locker, error) {
 			return nil, err
 		}
 
-		lease := &coordinationv1.Lease{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      name,
-				Namespace: locker.namespace,
-			},
-			Spec: coordinationv1.LeaseSpec{
-				LeaseTransitions: pointer.Int32Ptr(0),
-			},
-		}
-
-		err = locker.k8sclient.Create(context.TODO(), lease)
-		if err != nil {
+		err = locker.createLease(context.Background())
+		if err != nil && !k8serrors.IsAlreadyExists(err) {
 			return nil, err
 		}
 	}
 	return locker, nil
 }
 
+func (l *Locker) createLease(ctx context.Context) error {
+	lease := &coordinationv1.Lease{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      l.name,
+			Namespace: l.namespace,
+		},
+		Spec: coordinationv1.LeaseSpec{
+			LeaseTransitions: pointer.Int32Ptr(0),
+		},
+	}
+	return l.k8sclient.Create(ctx, lease)
+}
+
 func (l *Locker) lock(ctx context.Context) error {
 	// block until we get a lock
 	for {
+		select {
+		case <-ctx.Done():
+			return errors.New("lock failed: context cancelled")
+		default:
+		}
+
 		// get the Lease
 		lease := &coordinationv1.Lease{}
 		err := l.k8sclient.Get(ctx, types.NamespacedName{
 			Namespace: l.namespace,
 			Name:      l.name,
 		}, lease)
-		if err != nil {
+		if err != nil && !k8serrors.IsNotFound(err) {
 			return fmt.Errorf("could not get Lease resource for lock: %w", err)
+		}
+		if k8serrors.IsNotFound(err) {
+			// the Lease has been deleted, recreate it
+			err = l.createLease(ctx)
+			if err != nil && !k8serrors.IsAlreadyExists(err) {
+				return fmt.Errorf("could not create Lease resource for lock: %w", err)
+			}
+			time.Sleep(l.retryWait)
+			continue
 		}
 
 		if lease.Spec.HolderIdentity != nil {
@@ -222,14 +245,10 @@ func (l *Locker) unlock(ctx context.Context) error {
 		return fmt.Errorf("unlock: not the lock holder")
 	}
 
-	lease.Spec.HolderIdentity = nil
-	lease.Spec.AcquireTime = nil
-	lease.Spec.LeaseDurationSeconds = nil
-	err = l.k8sclient.Update(ctx, lease)
+	err = l.k8sclient.Delete(ctx, lease)
 	if err != nil {
-		return fmt.Errorf("unlock: error when trying to update Lease: %w", err)
+		return fmt.Errorf("unlock: error when trying to delete Lease: %w", err)
 	}
-
 	return nil
 }
 

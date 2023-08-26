@@ -12,6 +12,7 @@ import (
 	coordinationv1 "k8s.io/api/coordination/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/utils/pointer"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 )
@@ -25,12 +26,11 @@ var lockAttempts = 3
 var k8sclient client.Client
 
 func init() {
-	useExistingCluster := true
 	testEnv := &envtest.Environment{
 		ErrorIfCRDPathMissing:    true,
 		AttachControlPlaneOutput: true,
 		// local cluster is not working in our test case, like create pod by deployment controller
-		UseExistingCluster: &useExistingCluster,
+		UseExistingCluster: pointer.Bool(true),
 	}
 
 	// cfg is defined in this file globally.
@@ -55,18 +55,18 @@ func TestLocker(t *testing.T) {
 		lockers = append(lockers, locker)
 	}
 
-	wg := sync.WaitGroup{}
-	for _, locker := range lockers {
+	var wg sync.WaitGroup
+	for index, locker := range lockers {
 		wg.Add(1)
-		go func(l sync.Locker) {
-			defer wg.Done()
+		go func(l sync.Locker, index int) {
 
 			for i := 0; i < lockAttempts; i++ {
 				l.Lock()
 				time.Sleep(time.Duration(rand.Intn(10)) * time.Millisecond)
 				l.Unlock()
 			}
-		}(locker)
+			wg.Done()
+		}(locker, index)
 	}
 	wg.Wait()
 }
