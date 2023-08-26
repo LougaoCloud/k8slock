@@ -56,17 +56,17 @@ func TestLocker(t *testing.T) {
 	}
 
 	var wg sync.WaitGroup
-	for index, locker := range lockers {
+	for _, locker := range lockers {
 		wg.Add(1)
-		go func(l sync.Locker, index int) {
+		go func(l sync.Locker) {
+			defer wg.Done()
 
 			for i := 0; i < lockAttempts; i++ {
 				l.Lock()
 				time.Sleep(time.Duration(rand.Intn(10)) * time.Millisecond)
 				l.Unlock()
 			}
-			wg.Done()
-		}(locker, index)
+		}(locker)
 	}
 	wg.Wait()
 }
