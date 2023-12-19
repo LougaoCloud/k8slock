@@ -1,4 +1,4 @@
-# k8slock [![Godoc](https://godoc.org/github.com/lessgo-cloud/k8slock?status.svg)](https://godoc.org/github.com/lessgo-cloud/k8slock) [![Go Report Card](https://goreportcard.com/badge/github.com/lessgo-cloud/k8slock)](https://goreportcard.com/report/github.com/lessgo-cloud/k8slock)
+# k8slock [![Godoc](https://godoc.org/github.com/lougao-cloud/k8slock?status.svg)](https://godoc.org/github.com/lougao-cloud/k8slock) [![Go Report Card](https://goreportcard.com/badge/github.com/lougao-cloud/k8slock)](https://goreportcard.com/report/github.com/lougao-cloud/k8slock)
 
 k8slock is a Go module that makes it easy to do distributed locking using the [Lease](https://kubernetes.io/docs/reference/kubernetes-api/cluster-resources/lease-v1/) resource from the Kubernetes coordination API. 
 
@@ -12,7 +12,7 @@ This module implements the [sync.Locker](https://golang.org/pkg/sync/#Locker) in
 ```go
 package main
 
-import "github.com/lessgo-cloud/k8slock"
+import "github.com/lougao-cloud/k8slock"
 
 func main() {
     locker, err := k8slock.NewLocker("example-lock")
@@ -33,7 +33,7 @@ package main
 
 import (
     "context"
-    "github.com/lessgo-cloud/k8slock"
+    "github.com/lougao-cloud/k8slock"
 )
 
 func main() {

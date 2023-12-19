@@ -1,4 +1,4 @@
-module github.com/lessgo-cloud/k8slock
+module github.com/lougao-cloud/k8slock
 
 go 1.20
 
